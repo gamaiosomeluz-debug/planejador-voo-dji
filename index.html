@@ -2,8 +2,22 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Planejador de Voo DJI — v3</title>
+
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#111714">
+<link rel="icon" href="./icon-192.png">
+
+<!-- iOS: trata o site como app instalado (tela cheia, ícone próprio) -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Grade Voo">
+<link rel="apple-touch-icon" sizes="180x180" href="./icon-180.png">
+<link rel="apple-touch-icon" sizes="152x152" href="./icon-152.png">
+<link rel="apple-touch-icon" sizes="167x167" href="./icon-167.png">
+
 <style>
 /* required styles */
 
@@ -696,11 +710,12 @@ html[data-theme="light"]{
 html[data-theme="light"] #map .leaflet-tile-pane{filter:saturate(1) brightness(1)}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--bg0);color:var(--ink);font-family:var(--sans);overscroll-behavior:none}
-#app{display:grid;grid-template-columns:380px 1fr;grid-template-rows:52px 1fr;height:100vh}
+#app{display:grid;grid-template-columns:380px 1fr;grid-template-rows:calc(52px + env(safe-area-inset-top)) 1fr;height:100vh}
 
 /* HEADER */
 header{grid-column:1/3;display:flex;align-items:center;justify-content:space-between;
-  padding:0 16px;background:var(--bg1);border-bottom:1px solid var(--line)}
+  padding:0 16px;padding-top:env(safe-area-inset-top);
+  background:var(--bg1);border-bottom:1px solid var(--line)}
 .brand{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;
   color:var(--dim);display:flex;align-items:center;gap:8px}
 .brand b{color:var(--ink)}
@@ -773,7 +788,7 @@ aside{background:var(--bg1);border-right:1px solid var(--line);overflow-y:auto;d
 .btn.small{padding:6px 9px;font-size:11px;width:auto}
 .btn-row{display:flex;gap:6px}
 
-footer.sec{margin-top:auto;border-bottom:none}
+footer.sec{margin-top:auto;border-bottom:none;padding-bottom:calc(14px + env(safe-area-inset-bottom))}
 
 /* MAPA */
 main{position:relative;overflow:hidden;background:var(--bg0)}
@@ -843,7 +858,9 @@ input[type=file]{display:none}
 }
 
 @media(max-width:800px){
-  #app{grid-template-columns:1fr;grid-template-rows:52px 1fr 1fr}
+  #app{grid-template-columns:1fr;grid-template-rows:calc(52px + env(safe-area-inset-top)) 1fr 1fr}
+  header{grid-column:1}
+  aside,main{grid-column:1}
   aside{border-right:none;border-bottom:1px solid var(--line);max-height:48vh}
 }
 </style>
@@ -2242,6 +2259,12 @@ window.addEventListener('offline',()=>setNet(false,false));
 setNet(navigator.onLine);
 updateGSDPanel('gsd');
 
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  });
+}
+
 (function checkDraft(){
   try{
     const raw = localStorage.getItem(DRAFT_KEY);
@@ -2250,9 +2273,21 @@ updateGSDPanel('gsd');
     if(draft && draft.data && draft.data.poly && draft.data.poly.length>=3){
       const d = new Date(draft.savedAt);
       const when = d.toLocaleDateString('pt-BR')+' '+d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
-      if(confirm(`Encontramos um rascunho não salvo de ${when} (fechado sem salvar). Deseja recuperar?`)){
-        applyState(draft.data);
-      }
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:3000;'
+        + 'background:var(--bg1);border:1px solid var(--green);border-radius:var(--r);padding:10px 14px;'
+        + 'display:flex;gap:10px;align-items:center;font-size:12px;color:var(--ink);'
+        + 'box-shadow:0 4px 16px rgba(0,0,0,.5);max-width:92vw;flex-wrap:wrap';
+      const label = document.createElement('span');
+      label.textContent = `Rascunho não salvo de ${when} encontrado.`;
+      const btnYes = document.createElement('button');
+      btnYes.className = 'btn primary small'; btnYes.style.width='auto'; btnYes.textContent = 'Restaurar';
+      const btnNo = document.createElement('button');
+      btnNo.className = 'btn ghost small'; btnNo.style.width='auto'; btnNo.textContent = 'Descartar';
+      btnYes.addEventListener('click', ()=>{ applyState(draft.data); banner.remove(); });
+      btnNo.addEventListener('click', ()=>{ try{ localStorage.removeItem(DRAFT_KEY); }catch{} banner.remove(); });
+      banner.appendChild(label); banner.appendChild(btnYes); banner.appendChild(btnNo);
+      document.body.appendChild(banner);
     }
   }catch{}
 })();
