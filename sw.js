@@ -2,7 +2,7 @@
 // sem depender do cache HTTP do navegador (que pode ser limpo pelo sistema).
 // Não mexe em tiles de mapa (arcgisonline/openstreetmap): isso já é
 // cacheado à parte via IndexedDB dentro do próprio index.html.
-const CACHE_NAME = 'planejador-voo-shell-v5';
+const CACHE_NAME = 'planejador-voo-shell-v6';
 const ASSETS = [
   './',
   './index.html',

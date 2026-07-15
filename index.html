@@ -932,6 +932,8 @@ input[type=file]{display:none}
     <div class="hint">Em terreno irregular (morros/vales), a altura "relativa ao ponto inicial" sozinha faz o drone voar baixo demais nos pontos mais altos. Isso busca a elevação real do solo (dados SRTM) e ajusta a altura de cada waypoint — inclusive inserindo pontos no meio das linhas para acompanhar o relevo. Funciona offline se você já baixou a elevação da área (botão "Baixar mapa desta área" acima, com internet).</div>
     <div class="row"><label>Margem de segurança sobre obstáculos (m)</label><input type="number" id="safetyMargin" value="0" min="0" step="1"></div>
     <div class="hint">O SRTM enxerga o solo, não árvores/silos/torres. Some uma margem para voar acima do que o dado não vê (reduz um pouco o GSD). 10–20m é comum em área com vegetação alta.</div>
+    <div class="row"><label>Detalhe do relevo — tolerância (m)</label><input type="number" id="terrainDetail" value="5" min="1" max="15" step="1"></div>
+    <div class="hint">Insere um waypoint no meio da linha só quando o terreno desvia mais que este valor da reta entre as pontas. <b>Menor</b> (1–3m) = segue o relevo de perto, mais waypoints, arquivo mais pesado. <b>Maior</b> (10–15m) = mais econômico e leve pro controle, acompanha o relevo por cima. Padrão 5m.</div>
     <button class="btn ghost small" id="btnTerrainComp" style="width:100%;margin-bottom:6px" disabled>🏔 Compensar variação de terreno</button>
     <div id="terrainCompStatus"></div>
   </div>
@@ -1343,9 +1345,10 @@ async function fetchTerrainElevations(points){
 // linha — não só nas pontas. As amostras marcadas _interp são podadas depois,
 // mantendo só as que realmente mudam o perfil de altura.
 const TERRAIN_SAMPLE_M = 50;  // espaçamento de amostragem ao longo da linha (~SRTM 30m)
-const TERRAIN_DEV_M = 5;      // só insere waypoint se o terreno desviar > isso da reta entre as pontas
-                              // (5m é seguro: o próprio SRTM tem ~16m de erro; e mantém a
-                              //  contagem de waypoints baixa para não travar o controle DJI)
+// Tolerância de detalhe do relevo: vem do campo #terrainDetail (1–15m). Só insere
+// waypoint no meio da linha se o terreno desviar > isso da reta entre as pontas.
+// Menor = segue o relevo de perto (mais waypoints); maior = mais econômico/leve.
+function terrainDevM(){ return Math.min(15, Math.max(1, +v('terrainDetail')||5)); }
 
 function stripInterp(wps){ return wps.filter(w=>!w._interp); }
 
@@ -1388,12 +1391,13 @@ async function applyTerrainCompensation(){
     dense.forEach((wp,i)=>{ wp.terrainOffset = r2(elevations[i+1] - refElev); });
 
     // Poda: mantém pontas/cantos; mantém amostra intermediária só se o terreno
-    // desviar mais que TERRAIN_DEV_M da reta entre as pontas da linha (ou seja,
-    // só onde há morro/vale no meio da linha).
+    // desviar mais que a tolerância (#terrainDetail) da reta entre as pontas da
+    // linha (ou seja, só onde há morro/vale relevante no meio da linha).
+    const devLimit = terrainDevM();
     const kept = dense.filter(w=>{
       if(!w._interp) return true;
       const lin = w._a.terrainOffset + (w._b.terrainOffset - w._a.terrainOffset)*w._t;
-      return Math.abs(w.terrainOffset - lin) > TERRAIN_DEV_M;
+      return Math.abs(w.terrainOffset - lin) > devLimit;
     });
     let added = 0;
     kept.forEach(w=>{ if(w._interp) added++; delete w._a; delete w._b; delete w._t; });
@@ -1866,7 +1870,7 @@ document.getElementById('btnOptAngle').addEventListener('click',()=>{
   recalcMission();
 });
 
-['angle','bufferM','turnSpd','batteryMin'].forEach(id=>document.getElementById(id).addEventListener('input',recalcMission));
+['angle','bufferM','turnSpd','batteryMin','terrainDetail'].forEach(id=>document.getElementById(id).addEventListener('input',recalcMission));
 // margem de segurança não recalcula a rota (não apaga a compensação), só atualiza o aviso de altitude legal
 document.getElementById('safetyMargin').addEventListener('input',()=>updateAltitudeAlert((+gAlt.value)+Math.max(0,+v('safetyMargin')||0)));
 
@@ -2395,7 +2399,8 @@ function serializeState(){
     angle:v('angle'), altMode:v('altMode'), turnSpd:v('turnSpd'),
     missionName:v('missionName'),
     batteryMin: document.getElementById('batteryMin') ? v('batteryMin') : null,
-    safetyMargin: document.getElementById('safetyMargin') ? v('safetyMargin') : null
+    safetyMargin: document.getElementById('safetyMargin') ? v('safetyMargin') : null,
+    terrainDetail: document.getElementById('terrainDetail') ? v('terrainDetail') : null
   };
 }
 
@@ -2425,6 +2430,7 @@ function applyState(st){
   document.getElementById('missionName').value = st.missionName || 'Levantamento_01';
   if(st.batteryMin!=null && document.getElementById('batteryMin')) document.getElementById('batteryMin').value = st.batteryMin;
   if(st.safetyMargin!=null && document.getElementById('safetyMargin')) document.getElementById('safetyMargin').value = st.safetyMargin;
+  if(st.terrainDetail!=null && document.getElementById('terrainDetail')) document.getElementById('terrainDetail').value = st.terrainDetail;
 
   clearAll();
   document.getElementById('drawCtrl').style.display='none';
