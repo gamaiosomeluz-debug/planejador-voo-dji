@@ -929,7 +929,9 @@ input[type=file]{display:none}
   <!-- COMPENSAÇÃO DE TERRENO -->
   <div class="sec">
     <h3>Compensação de terreno <span class="badge">recomendado</span></h3>
-    <div class="hint">Em terreno irregular (morros/vales), a altura "relativa ao ponto inicial" sozinha faz o drone voar baixo demais nos pontos mais altos. Isso busca a elevação real do solo (dados SRTM) e ajusta a altura de cada waypoint para manter a altura real sobre o solo constante. Funciona offline se você já baixou a elevação da área (botão "Baixar mapa desta área" acima, com internet).</div>
+    <div class="hint">Em terreno irregular (morros/vales), a altura "relativa ao ponto inicial" sozinha faz o drone voar baixo demais nos pontos mais altos. Isso busca a elevação real do solo (dados SRTM) e ajusta a altura de cada waypoint — inclusive inserindo pontos no meio das linhas para acompanhar o relevo. Funciona offline se você já baixou a elevação da área (botão "Baixar mapa desta área" acima, com internet).</div>
+    <div class="row"><label>Margem de segurança sobre obstáculos (m)</label><input type="number" id="safetyMargin" value="0" min="0" step="1"></div>
+    <div class="hint">O SRTM enxerga o solo, não árvores/silos/torres. Some uma margem para voar acima do que o dado não vê (reduz um pouco o GSD). 10–20m é comum em área com vegetação alta.</div>
     <button class="btn ghost small" id="btnTerrainComp" style="width:100%;margin-bottom:6px" disabled>🏔 Compensar variação de terreno</button>
     <div id="terrainCompStatus"></div>
   </div>
@@ -970,6 +972,7 @@ input[type=file]{display:none}
         </div>
       </div>
       <div id="gsdStatus" class="gsd-status ok">—</div>
+      <div id="blurStatus" class="gsd-status ok" style="margin-top:6px">—</div>
     </div>
     <div class="row"><label>Overlap frontal (%)</label><input type="number" id="ofr" value="80" step="1" min="10" max="95"></div>
     <div class="row"><label>Overlap lateral (%)</label><input type="number" id="osd" value="65" step="1" min="10" max="95"></div>
@@ -1335,6 +1338,33 @@ async function fetchTerrainElevations(points){
   return out;
 }
 
+// Densifica cada LINHA de varredura (segmento entre dois pontos não-canto)
+// com amostras intermediárias, para conseguir seguir o relevo no meio da
+// linha — não só nas pontas. As amostras marcadas _interp são podadas depois,
+// mantendo só as que realmente mudam o perfil de altura.
+const TERRAIN_SAMPLE_M = 40;  // espaçamento de amostragem ao longo da linha (~SRTM 30m)
+const TERRAIN_DEV_M = 3;      // só insere waypoint se o terreno desviar > isso da reta entre as pontas
+
+function stripInterp(wps){ return wps.filter(w=>!w._interp); }
+
+function densifyScanLines(wps){
+  const out=[];
+  for(let i=0;i<wps.length;i++){
+    out.push(wps[i]);
+    const a=wps[i], b=wps[i+1];
+    if(b && !a.isCorner && !b.isCorner){          // é uma linha de varredura
+      const d=distLL(a,b);
+      const n=Math.floor(d/TERRAIN_SAMPLE_M);
+      for(let k=1;k<n;k++){
+        const t=k/n;
+        out.push({ lat:a.lat+(b.lat-a.lat)*t, lon:a.lon+(b.lon-a.lon)*t,
+                   speed:a.speed, isCorner:false, _interp:true, _a:a, _b:b, _t:t });
+      }
+    }
+  }
+  return out;
+}
+
 async function applyTerrainCompensation(){
   if(S.waypoints.length<2){ alert('Calcule a rota (feche o polígono) antes de compensar o terreno.'); return; }
 
@@ -1342,17 +1372,30 @@ async function applyTerrainCompensation(){
   const btn = document.getElementById('btnTerrainComp');
   btn.disabled = true;
   status.innerHTML = navigator.onLine
-    ? '<div class="alert info">Consultando elevação real do terreno (SRTM)…</div>'
+    ? '<div class="alert info">Consultando elevação real do terreno (SRTM) ao longo das linhas…</div>'
     : '<div class="alert info">Offline — usando elevação do cache baixado previamente…</div>';
 
   try{
-    const refPt = S.startPt || S.waypoints[0];
-    const points = [refPt, ...S.waypoints];
+    const base = stripInterp(S.waypoints);      // remove densificação de rodada anterior
+    const dense = densifyScanLines(base);        // insere amostras ao longo das linhas
+    const refPt = S.startPt || base[0];
+    const points = [refPt, ...dense];
     const elevations = await fetchTerrainElevations(points);
     const refElev = elevations[0];
-    const wpElevations = elevations.slice(1);
 
-    S.waypoints.forEach((wp,i)=>{ wp.terrainOffset = r2(wpElevations[i] - refElev); });
+    dense.forEach((wp,i)=>{ wp.terrainOffset = r2(elevations[i+1] - refElev); });
+
+    // Poda: mantém pontas/cantos; mantém amostra intermediária só se o terreno
+    // desviar mais que TERRAIN_DEV_M da reta entre as pontas da linha (ou seja,
+    // só onde há morro/vale no meio da linha).
+    const kept = dense.filter(w=>{
+      if(!w._interp) return true;
+      const lin = w._a.terrainOffset + (w._b.terrainOffset - w._a.terrainOffset)*w._t;
+      return Math.abs(w.terrainOffset - lin) > TERRAIN_DEV_M;
+    });
+    let added = 0;
+    kept.forEach(w=>{ if(w._interp) added++; delete w._a; delete w._b; delete w._t; });
+    S.waypoints = kept;
 
     const offs = S.waypoints.map(w=>w.terrainOffset);
     const minOff = Math.min(...offs), maxOff = Math.max(...offs);
@@ -1360,19 +1403,33 @@ async function applyTerrainCompensation(){
     S.terrainCompensation = { active:true, minOff, maxOff, refElev };
 
     const alt = +gAlt.value;
-    let msg = `Compensação aplicada. O terreno varia ${variacao.toFixed(1)}m nesta área — `
-      + `a altura relativa ao ponto de decolagem enviada ao drone vai de ${(alt+minOff).toFixed(1)}m a ${(alt+maxOff).toFixed(1)}m, `
-      + `para manter ~${alt}m reais sobre o solo em todos os pontos.`;
+    const margem = Math.max(0, +v('safetyMargin')||0);
+    let msg = `Compensação aplicada`;
+    if(added>0) msg += ` (+${added} waypoint(s) inseridos para acompanhar o relevo no meio das linhas)`;
+    msg += `. O terreno varia ${variacao.toFixed(1)}m — a altura relativa à decolagem vai de ${(alt+margem+minOff).toFixed(1)}m a ${(alt+margem+maxOff).toFixed(1)}m, `
+      + `mantendo ~${alt+margem}m reais sobre o solo em todos os pontos.`;
     let cls = 'ok';
-    if(variacao > 80){
+    // P3 — aviso de RTH: o retorno sobe a uma altura relativa à decolagem
+    if(maxOff > 15){
+      msg += ` ⚠ RETORNO (RTH): o relevo sobe até ${maxOff.toFixed(0)}m acima da decolagem. Configure a "altura de retorno" no DJI Fly para pelo menos ${Math.ceil(maxOff+30)}m, senão o drone pode voltar abaixo do terreno.`;
       cls = 'warn';
-      msg += ' ⚠ Variação grande — considere revisar se a missão inteira faz sentido com um único ponto de decolagem.';
+    }
+    // P2 — overlap lateral cai em encosta acentuada
+    if(variacao > 60){
+      msg += ` ⚠ Relevo acentuado: o overlap lateral efetivo cai nas encostas — considere aumentar o "overlap lateral" para 75–80% para evitar falhas no mosaico.`;
+      cls = 'warn';
     }
     status.innerHTML = `<div class="alert ${cls}">${msg}</div>`;
+
+    // atualiza métricas de waypoints/percurso (a rota mudou)
+    let totalD=0; for(let i=0;i+1<S.waypoints.length;i++) totalD+=distLL(S.waypoints[i],S.waypoints[i+1]);
+    document.getElementById('mWp').textContent=S.waypoints.length;
+    document.getElementById('mDist').textContent=Math.round(totalD);
     renderLayers();
   }catch(e){
     status.innerHTML = `<div class="alert warn">Não foi possível buscar a elevação (${e.message}). A missão será exportada com altura fixa, sem compensar o terreno.</div>`;
     S.terrainCompensation = null;
+    S.waypoints = stripInterp(S.waypoints);
     S.waypoints.forEach(wp=>{ delete wp.terrainOffset; });
   }
   btn.disabled = false;
@@ -1550,6 +1607,20 @@ function updateGSDPanel(src){
   else { msg=`GSD ${c.gsd} cm/px · Alt ${c.alt} m · Vel ${c.speed} m/s · Overlap F:${realOverlapFront.toFixed(0)}% L:${realOverlapSide.toFixed(0)}%`; }
   st.className=`gsd-status ${cls}`;
   st.textContent=msg;
+
+  // P4 — motion blur: o drone não pode andar mais que ~1 pixel (1 GSD) durante
+  // a exposição. Obturador máximo (s) = GSD(m) / velocidade(m/s).
+  const bst=document.getElementById('blurStatus');
+  if(c.speed>0 && c.gsd>0){
+    const gsd_m = c.gsd/100;
+    const shutterMax = gsd_m / c.speed;          // segundos
+    const denom = Math.round(1/shutterMax);      // 1/denom s
+    const speedFor500 = r2(gsd_m * 500);         // velocidade que borraria 1px a 1/500s
+    let bcls = denom>=500 ? 'ok' : denom>=250 ? 'warn' : 'bad';
+    bst.className = `gsd-status ${bcls}`;
+    bst.textContent = `Nitidez: use obturador mais rápido que 1/${denom}s nesta velocidade (${c.speed} m/s). `
+      + (denom<500 ? `Em luz fraca isso é difícil — reduza a velocidade para ≤ ${speedFor500} m/s ou voe com boa luz.` : `Ok para luz normal.`);
+  } else { bst.className='gsd-status ok'; bst.textContent='—'; }
 
   recalcMission();
 }
@@ -1784,6 +1855,8 @@ document.getElementById('btnOptAngle').addEventListener('click',()=>{
 });
 
 ['angle','bufferM','turnSpd','batteryMin'].forEach(id=>document.getElementById(id).addEventListener('input',recalcMission));
+// margem de segurança não recalcula a rota (não apaga a compensação), só atualiza o aviso de altitude legal
+document.getElementById('safetyMargin').addEventListener('input',()=>updateAltitudeAlert((+gAlt.value)+Math.max(0,+v('safetyMargin')||0)));
 
 // ═══════════════════════════════════════════════════════════════
 // RECÁLCULO CENTRAL DA MISSÃO
@@ -1800,7 +1873,7 @@ function recalcMission(){
   const alt  = +gAlt.value;
   const lineSpd = +gSpd.value;
   const turnSpd = +v('turnSpd');
-  updateAltitudeAlert(alt);
+  updateAltitudeAlert(alt + Math.max(0, +v('safetyMargin')||0));
 
   const {segments, waypointsXY} = boustrophedon(S.bufPoly, sp, ang, origin);
 
@@ -1860,11 +1933,13 @@ function recalcMission(){
   const battMin = +v('batteryMin')||0;
   const battStatus = document.getElementById('batteryStatus');
   if(battMin>0 && estSec>0){
-    const nBatt = splitMissionByBattery(S.waypoints, battMin*60).length;
+    const usableSec = usableBatterySec(battMin);
+    const nBatt = splitMissionByBattery(S.waypoints, usableSec).length;
+    const usableMin = (usableSec/60).toFixed(1);
     if(nBatt>1){
-      battStatus.innerHTML = `<div class="alert warn">⚠ Voo estimado (${fmtTime(estSec)}) excede a autonomia de ${battMin}min. A exportação vai gerar ${nBatt} arquivos .kmz (um por bateria).</div>`;
+      battStatus.innerHTML = `<div class="alert warn">⚠ Voo estimado (${fmtTime(estSec)}) excede o tempo útil por bateria (~${usableMin}min já descontando reserva de 25%, subida/descida e trânsito). A exportação vai gerar ${nBatt} arquivos .kmz.</div>`;
     } else {
-      battStatus.innerHTML = `<div class="alert ok">Cabe em 1 bateria (${battMin}min de autonomia configurada).</div>`;
+      battStatus.innerHTML = `<div class="alert ok">Cabe em 1 bateria (tempo útil ~${usableMin}min, já com reserva de 25% e trânsito descontados).</div>`;
     }
   } else {
     battStatus.innerHTML = '';
@@ -2169,6 +2244,21 @@ function dl(blob, name){ const u=URL.createObjectURL(blob),a=document.createElem
 // cortando sempre no fim de uma linha de voo (nunca no meio de uma linha
 // nem no meio do padrão de cantos duplos), para que cada bateria comece
 // exatamente onde a anterior terminou.
+// Tempo ÚTIL de voo por bateria: desconta reserva de segurança (25%), subida e
+// descida, e o trânsito do ponto de início ao 1º waypoint + retorno (RTH).
+// Evita o otimismo de dividir só pela distância da rota.
+function usableBatterySec(battMin){
+  const RESERVE = 0.25, ASCENT = 2.5;
+  const alt = (+gAlt.value) + Math.max(0, +v('safetyMargin')||0);
+  const cruise = (+gSpd.value) || 8;
+  let overhead = 2*(alt/ASCENT);                    // subir + descer
+  if(S.startPt && S.waypoints.length>=1){
+    overhead += distLL(S.startPt, S.waypoints[0])/cruise;                       // ida até o 1º wp
+    overhead += distLL(S.waypoints[S.waypoints.length-1], S.startPt)/cruise;    // RTH
+  }
+  return Math.max(60, battMin*60*(1-RESERVE) - overhead);
+}
+
 function splitMissionByBattery(wps, batterySec){
   if(!wps.length || batterySec<=0) return [wps];
   const chunks=[];
@@ -2191,10 +2281,12 @@ function splitMissionByBattery(wps, batterySec){
 document.getElementById('btnExport').addEventListener('click',()=>{
   if(S.waypoints.length<2) return;
   const name=v('missionName').trim()||'Missao';
-  const alt=+gAlt.value, lineSpd=+gSpd.value, turnSpd=+v('turnSpd');
+  // margem de segurança sobre obstáculos é somada à altura de todos os waypoints
+  const alt=+gAlt.value + Math.max(0, +v('safetyMargin')||0);
+  const lineSpd=+gSpd.value, turnSpd=+v('turnSpd');
   const altMode=v('altMode');
   const battMin=+v('batteryMin')||0;
-  const chunks = battMin>0 ? splitMissionByBattery(S.waypoints, battMin*60) : [S.waypoints];
+  const chunks = battMin>0 ? splitMissionByBattery(S.waypoints, usableBatterySec(battMin)) : [S.waypoints];
 
   if(chunks.length<=1){
     const tmpl=buildTemplate(name,lineSpd,turnSpd);
@@ -2277,7 +2369,8 @@ function serializeState(){
     ofr:v('ofr'), osd:v('osd'), intv:v('intv'),
     angle:v('angle'), altMode:v('altMode'), turnSpd:v('turnSpd'),
     missionName:v('missionName'),
-    batteryMin: document.getElementById('batteryMin') ? v('batteryMin') : null
+    batteryMin: document.getElementById('batteryMin') ? v('batteryMin') : null,
+    safetyMargin: document.getElementById('safetyMargin') ? v('safetyMargin') : null
   };
 }
 
@@ -2306,6 +2399,7 @@ function applyState(st){
   document.getElementById('turnSpd').value = st.turnSpd ?? 8;
   document.getElementById('missionName').value = st.missionName || 'Levantamento_01';
   if(st.batteryMin!=null && document.getElementById('batteryMin')) document.getElementById('batteryMin').value = st.batteryMin;
+  if(st.safetyMargin!=null && document.getElementById('safetyMargin')) document.getElementById('safetyMargin').value = st.safetyMargin;
 
   clearAll();
   document.getElementById('drawCtrl').style.display='none';
