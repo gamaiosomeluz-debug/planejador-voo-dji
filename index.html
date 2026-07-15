@@ -929,7 +929,7 @@ input[type=file]{display:none}
   <!-- COMPENSAÇÃO DE TERRENO -->
   <div class="sec">
     <h3>Compensação de terreno <span class="badge">recomendado</span></h3>
-    <div class="hint">Em terreno irregular (morros/vales), a altura "relativa ao ponto inicial" sozinha faz o drone voar baixo demais nos pontos mais altos. Isso busca a elevação real do solo (dados SRTM) e ajusta a altura de cada waypoint para manter a altura real sobre o solo constante. Precisa de internet — faça antes de ir a campo.</div>
+    <div class="hint">Em terreno irregular (morros/vales), a altura "relativa ao ponto inicial" sozinha faz o drone voar baixo demais nos pontos mais altos. Isso busca a elevação real do solo (dados SRTM) e ajusta a altura de cada waypoint para manter a altura real sobre o solo constante. Funciona offline se você já baixou a elevação da área (botão "Baixar mapa desta área" acima, com internet).</div>
     <button class="btn ghost small" id="btnTerrainComp" style="width:100%;margin-bottom:6px" disabled>🏔 Compensar variação de terreno</button>
     <div id="terrainCompStatus"></div>
   </div>
@@ -1109,13 +1109,25 @@ let tileDb = null;
 (async () => {
   try {
     tileDb = await new Promise((res,rej) => {
-      const r = indexedDB.open('fp-tiles',1);
-      r.onupgradeneeded = () => r.result.createObjectStore('t');
+      const r = indexedDB.open('fp-tiles',2);
+      r.onupgradeneeded = (ev) => {
+        const db = r.result;
+        if(!db.objectStoreNames.contains('t')) db.createObjectStore('t'); // tiles de mapa
+        if(!db.objectStoreNames.contains('e')) db.createObjectStore('e'); // elevação do terreno
+      };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej();
     });
   } catch(e){}
 })();
+
+// Elevação: cacheada por célula de grade (~28 m, próximo da resolução SRTM 30 m),
+// para que consultas próximas reaproveitem o mesmo valor e a compensação de
+// terreno funcione offline em campo depois de baixada com sinal.
+const ELEV_GRID = 0.00025;
+function elevKey(lat,lon){ return Math.round(lat/ELEV_GRID)*ELEV_GRID + ',' + Math.round(lon/ELEV_GRID)*ELEV_GRID; }
+async function elevGet(k){ if(!tileDb) return undefined; return new Promise(r=>{ try{ const tx=tileDb.transaction('e','readonly'); const q=tx.objectStore('e').get(k); q.onsuccess=()=>r(q.result); q.onerror=()=>r(undefined); }catch{r(undefined)} }); }
+async function elevPut(k,v){ if(!tileDb) return; try{ const tx=tileDb.transaction('e','readwrite'); tx.objectStore('e').put(v,k); }catch{} }
 
 async function tileGet(k){ if(!tileDb) return null; return new Promise(r=>{ try{ const tx=tileDb.transaction('t','readonly'); const q=tx.objectStore('t').get(k); q.onsuccess=()=>r(q.result||null); q.onerror=()=>r(null); }catch{r(null)} }); }
 async function tilePut(k,v){ if(!tileDb) return; try{ const tx=tileDb.transaction('t','readwrite'); tx.objectStore('t').put(v,k); }catch{} }
@@ -1216,7 +1228,29 @@ async function downloadOfflineArea(){
       st.innerHTML = `<div class="alert info">Baixando mapa offline… ${done}/${tiles.length} tiles${failed?` (${failed} falharam)`:''}</div>`;
     }
   }
-  st.innerHTML = `<div class="alert ok">Download concluído: ${done-failed}/${tiles.length} tiles salvos para uso offline (zoom ${zMin}–${zMax}).</div>`;
+  st.innerHTML = `<div class="alert info">Mapa salvo (${done-failed}/${tiles.length} tiles). Agora baixando a elevação do terreno…</div>`;
+
+  // Pré-download da ELEVAÇÃO: amostra uma grade sobre a área (com margem) e
+  // guarda no cache, para a compensação de terreno funcionar offline em campo.
+  try{
+    const gridPts = [];
+    const stepLat = ELEV_GRID, stepLon = ELEV_GRID;
+    const padLat = 3*stepLat, padLon = 3*stepLon; // margem extra além da área
+    for(let la=latMin-padLat; la<=latMax+padLat; la+=stepLat)
+      for(let lo=lonMin-padLon; lo<=lonMax+padLon; lo+=stepLon)
+        gridPts.push({lat:la, lon:lo});
+    // fetchTerrainElevations já cacheia cada ponto no IndexedDB
+    let egDone=0;
+    const egChunk=200;
+    for(let i=0;i<gridPts.length;i+=egChunk){
+      await fetchTerrainElevations(gridPts.slice(i,i+egChunk));
+      egDone=Math.min(i+egChunk, gridPts.length);
+      st.innerHTML = `<div class="alert info">Mapa salvo. Baixando elevação do terreno… ${egDone}/${gridPts.length} pontos</div>`;
+    }
+    st.innerHTML = `<div class="alert ok">Pronto para offline: ${done-failed}/${tiles.length} tiles de mapa + ${gridPts.length} pontos de elevação (zoom ${zMin}–${zMax}). A compensação de terreno agora funciona sem internet nesta área.</div>`;
+  }catch(e){
+    st.innerHTML = `<div class="alert warn">Mapa salvo (${done-failed}/${tiles.length} tiles), mas a elevação falhou (${e.message}). O mapa funciona offline; a compensação de terreno ainda vai precisar de sinal.</div>`;
+  }
   btn.disabled = S.poly.length<3;
 }
 
@@ -1262,34 +1296,54 @@ function polygonAreaM2(polyLL){
 // Corrige o caso de terreno irregular fazer o drone voar baixo demais
 // em pontos mais altos quando se usa só "relativa ao ponto inicial".
 // ═══════════════════════════════════════════════════════════════
+// Busca a elevação de uma lista de pontos, CACHE-PRIMEIRO: usa o que já está
+// no IndexedDB (baixado previamente) e só vai à rede para os pontos faltantes.
+// Isso permite compensar o terreno offline em campo, desde que a área tenha
+// sido baixada antes com sinal.
 async function fetchTerrainElevations(points){
-  // Open-Elevation: gratuito, sem chave, e com CORS liberado (Open Topo Data
-  // não manda cabeçalho CORS, então não funciona chamado direto do navegador).
-  const results = [];
-  const chunkSize = 50;
-  for(let i=0;i<points.length;i+=chunkSize){
-    const chunk = points.slice(i, i+chunkSize);
-    const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ locations: chunk.map(p=>({latitude:p.lat, longitude:p.lon})) })
-    });
-    if(!res.ok) throw new Error(`HTTP ${res.status} na consulta de elevação`);
-    const data = await res.json();
-    if(!data.results) throw new Error('resposta inesperada da API de elevação');
-    data.results.forEach(r=>results.push(r.elevation));
+  const out = new Array(points.length);
+  const missIdx = [];
+  for(let i=0;i<points.length;i++){
+    const cached = await elevGet(elevKey(points[i].lat, points[i].lon));
+    if(typeof cached === 'number'){ out[i] = cached; } else { missIdx.push(i); }
   }
-  return results;
+
+  if(missIdx.length){
+    if(!navigator.onLine){
+      throw new Error(`${missIdx.length} ponto(s) sem elevação no cache offline. Baixe o mapa/elevação desta área com internet antes de ir a campo.`);
+    }
+    // Open-Elevation: gratuito, sem chave, e com CORS liberado (Open Topo Data
+    // não manda cabeçalho CORS, então não funciona chamado direto do navegador).
+    const chunkSize = 50;
+    for(let i=0;i<missIdx.length;i+=chunkSize){
+      const idxChunk = missIdx.slice(i, i+chunkSize);
+      const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locations: idxChunk.map(j=>({latitude:points[j].lat, longitude:points[j].lon})) })
+      });
+      if(!res.ok) throw new Error(`HTTP ${res.status} na consulta de elevação`);
+      const data = await res.json();
+      if(!data.results) throw new Error('resposta inesperada da API de elevação');
+      data.results.forEach((r,k)=>{
+        const j = idxChunk[k];
+        out[j] = r.elevation;
+        elevPut(elevKey(points[j].lat, points[j].lon), r.elevation);
+      });
+    }
+  }
+  return out;
 }
 
 async function applyTerrainCompensation(){
   if(S.waypoints.length<2){ alert('Calcule a rota (feche o polígono) antes de compensar o terreno.'); return; }
-  if(!navigator.onLine){ alert('Sem internet agora. A compensação de terreno precisa consultar um serviço online — faça isso ainda com sinal, antes de ir a campo.'); return; }
 
   const status = document.getElementById('terrainCompStatus');
   const btn = document.getElementById('btnTerrainComp');
   btn.disabled = true;
-  status.innerHTML = '<div class="alert info">Consultando elevação real do terreno (SRTM)…</div>';
+  status.innerHTML = navigator.onLine
+    ? '<div class="alert info">Consultando elevação real do terreno (SRTM)…</div>'
+    : '<div class="alert info">Offline — usando elevação do cache baixado previamente…</div>';
 
   try{
     const refPt = S.startPt || S.waypoints[0];
