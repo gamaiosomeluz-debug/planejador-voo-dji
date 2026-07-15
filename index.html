@@ -1342,8 +1342,10 @@ async function fetchTerrainElevations(points){
 // com amostras intermediárias, para conseguir seguir o relevo no meio da
 // linha — não só nas pontas. As amostras marcadas _interp são podadas depois,
 // mantendo só as que realmente mudam o perfil de altura.
-const TERRAIN_SAMPLE_M = 40;  // espaçamento de amostragem ao longo da linha (~SRTM 30m)
-const TERRAIN_DEV_M = 3;      // só insere waypoint se o terreno desviar > isso da reta entre as pontas
+const TERRAIN_SAMPLE_M = 50;  // espaçamento de amostragem ao longo da linha (~SRTM 30m)
+const TERRAIN_DEV_M = 5;      // só insere waypoint se o terreno desviar > isso da reta entre as pontas
+                              // (5m é seguro: o próprio SRTM tem ~16m de erro; e mantém a
+                              //  contagem de waypoints baixa para não travar o controle DJI)
 
 function stripInterp(wps){ return wps.filter(w=>!w._interp); }
 
@@ -1425,6 +1427,16 @@ async function applyTerrainCompensation(){
     let totalD=0; for(let i=0;i+1<S.waypoints.length;i++) totalD+=distLL(S.waypoints[i],S.waypoints[i+1]);
     document.getElementById('mWp').textContent=S.waypoints.length;
     document.getElementById('mDist').textContent=Math.round(totalD);
+
+    // aviso de arquivos/contagem já com a rota densificada pelo relevo
+    const bMin=+v('batteryMin')||0;
+    const chks=splitMissionByBattery(S.waypoints, bMin>0?usableBatterySec(bMin):0);
+    const maxW=chks.reduce((a,c)=>Math.max(a,c.length),0);
+    const bs=document.getElementById('batteryStatus');
+    bs.innerHTML = chks.length>1
+      ? `<div class="alert ok">Exportação: ${chks.length} arquivos .kmz (maior com ${maxW} waypoints — dentro do limite do controle).</div>`
+      : `<div class="alert ok">Exportação: 1 arquivo .kmz com ${S.waypoints.length} waypoints — ok para o controle.</div>`;
+
     renderLayers();
   }catch(e){
     status.innerHTML = `<div class="alert warn">Não foi possível buscar a elevação (${e.message}). A missão será exportada com altura fixa, sem compensar o terreno.</div>`;
@@ -1932,14 +1944,18 @@ function recalcMission(){
 
   const battMin = +v('batteryMin')||0;
   const battStatus = document.getElementById('batteryStatus');
-  if(battMin>0 && estSec>0){
-    const usableSec = usableBatterySec(battMin);
-    const nBatt = splitMissionByBattery(S.waypoints, usableSec).length;
+  if(estSec>0 && S.waypoints.length>=2){
+    const usableSec = battMin>0 ? usableBatterySec(battMin) : 0;
+    const chunks = splitMissionByBattery(S.waypoints, usableSec);
+    const nBatt = chunks.length;
+    const maxWp = chunks.reduce((a,c)=>Math.max(a,c.length),0);
     const usableMin = (usableSec/60).toFixed(1);
-    if(nBatt>1){
-      battStatus.innerHTML = `<div class="alert warn">⚠ Voo estimado (${fmtTime(estSec)}) excede o tempo útil por bateria (~${usableMin}min já descontando reserva de 25%, subida/descida e trânsito). A exportação vai gerar ${nBatt} arquivos .kmz.</div>`;
+    if(nBatt>1 && battMin>0){
+      battStatus.innerHTML = `<div class="alert warn">⚠ Vai gerar ${nBatt} arquivos .kmz. Voo estimado ${fmtTime(estSec)}, tempo útil por bateria ~${usableMin}min (já com reserva de 25%, subida/descida e trânsito). Maior arquivo: ${maxWp} waypoints.</div>`;
+    } else if(nBatt>1){
+      battStatus.innerHTML = `<div class="alert warn">⚠ A rota tem muitos waypoints (relevo) e vai ser dividida em ${nBatt} arquivos .kmz para não travar o controle (máx. ${MAX_WP_PER_FILE} por arquivo). Defina a autonomia de bateria acima para dividir também por tempo de voo.</div>`;
     } else {
-      battStatus.innerHTML = `<div class="alert ok">Cabe em 1 bateria (tempo útil ~${usableMin}min, já com reserva de 25% e trânsito descontados).</div>`;
+      battStatus.innerHTML = `<div class="alert ok">Cabe em 1 arquivo (${S.waypoints.length} waypoints${battMin>0?`, tempo útil ~${usableMin}min`:''}).</div>`;
     }
   } else {
     battStatus.innerHTML = '';
@@ -2259,19 +2275,26 @@ function usableBatterySec(battMin){
   return Math.max(60, battMin*60*(1-RESERVE) - overhead);
 }
 
+// Teto de waypoints por arquivo: o DJI Fly no controle de tela trava/engasga
+// com missões muito grandes. Cortamos por tempo de bateria E por contagem,
+// sempre num fim de linha, para nenhum .kmz ficar pesado demais.
+const MAX_WP_PER_FILE = 90;
 function splitMissionByBattery(wps, batterySec){
-  if(!wps.length || batterySec<=0) return [wps];
+  if(!wps.length) return [wps];
   const chunks=[];
-  let chunkStart=0, accSec=0;
+  let chunkStart=0, accSec=0, count=1;
   for(let i=0;i+1<wps.length;i++){
     const d=distLL(wps[i],wps[i+1]);
     const spd=wps[i+1].speed||wps[i].speed||1;
     accSec += d/spd;
+    count++;
     const isSafeCut = !wps[i].isCorner && wps[i+1].isCorner; // fim de linha, antes da transição
-    if(accSec>=batterySec && isSafeCut && i+1>chunkStart){
+    const timeExceeded  = batterySec>0 && accSec>=batterySec;
+    const countExceeded = count>=MAX_WP_PER_FILE;
+    if((timeExceeded||countExceeded) && isSafeCut && i+1>chunkStart){
       chunks.push(wps.slice(chunkStart, i+1));
       chunkStart=i+1;
-      accSec=0;
+      accSec=0; count=1;
     }
   }
   chunks.push(wps.slice(chunkStart));
@@ -2286,7 +2309,9 @@ document.getElementById('btnExport').addEventListener('click',()=>{
   const lineSpd=+gSpd.value, turnSpd=+v('turnSpd');
   const altMode=v('altMode');
   const battMin=+v('batteryMin')||0;
-  const chunks = battMin>0 ? splitMissionByBattery(S.waypoints, usableBatterySec(battMin)) : [S.waypoints];
+  // sempre passa pelo split: mesmo sem bateria configurada, o teto de waypoints
+  // por arquivo (MAX_WP_PER_FILE) é aplicado para não travar o controle DJI.
+  const chunks = splitMissionByBattery(S.waypoints, battMin>0 ? usableBatterySec(battMin) : 0);
 
   if(chunks.length<=1){
     const tmpl=buildTemplate(name,lineSpd,turnSpd);
